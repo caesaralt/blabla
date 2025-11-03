@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Interactive Floor Plan Editor - {{ project_name }}</title>
+    <title>Interactive Floor Plan Editor - {{ project_name | default('Manual Takeoff') }}</title>
     <style>
         * {
             margin: 0;
@@ -239,6 +239,14 @@
             border-radius: 8px;
             transition: all 0.3s;
             cursor: pointer;
+        }
+
+        .symbol-item .symbol-meta {
+            flex: 1 0 100%;
+            font-size: 0.8em;
+            color: #a0aec0;
+            margin-top: 6px;
+            line-height: 1.35;
         }
 
         .symbol-item:hover {
@@ -488,17 +496,17 @@
 
     <script>
         // Configuration
-        const PROJECT_ID = "{{ project_id }}";
-        const PROJECT_NAME = "{{ project_name }}";
-        const TIER = "{{ tier }}";
-        
+        const PROJECT_ID = "{{ project_id | default('sandbox') }}";
+        const PROJECT_NAME = "{{ project_name | default('Manual Takeoff') }}";
+        const TIER = "{{ tier | default('basic') }}";
+
         // Pricing data
-        const pricing = {{ pricing | tojson }};
-        const markup = 0.20;
+        const pricing = {{ (pricing or {}) | tojson }};
+        const markup = {{ (markup_percentage | default(20)) / 100 }};
 
         // State
         let floorplanImage = new Image();
-        let symbols = {{ initial_symbols | tojson }};
+        let symbols = {{ (initial_symbols or []) | tojson }};
         let selectedSymbolType = null;
         let selectedSymbol = null;
         let selectedSymbols = new Set();
@@ -534,8 +542,26 @@
                 updatePricing();
                 updateSymbolsList();
             };
-            
-            floorplanImage.src = "{{ floor_plan_image }}";
+
+            const floorPlanSrc = "{{ floor_plan_image | default('') }}";
+            if (floorPlanSrc) {
+                floorplanImage.src = floorPlanSrc;
+            } else {
+                const placeholder = document.createElement('canvas');
+                placeholder.width = 1600;
+                placeholder.height = 1200;
+                const phCtx = placeholder.getContext('2d');
+                phCtx.fillStyle = '#f0f4ff';
+                phCtx.fillRect(0, 0, placeholder.width, placeholder.height);
+                phCtx.strokeStyle = '#c3d4ff';
+                phCtx.setLineDash([10, 10]);
+                phCtx.strokeRect(40, 40, placeholder.width - 80, placeholder.height - 80);
+                phCtx.setLineDash([]);
+                phCtx.font = '32px Arial';
+                phCtx.fillStyle = '#667eea';
+                phCtx.fillText('Upload a floor plan to begin AI assisted takeoffs', 300, placeholder.height / 2);
+                floorplanImage.src = placeholder.toDataURL();
+            }
 
             // Symbol button clicks
             document.querySelectorAll('.symbol-button').forEach(btn => {
@@ -743,22 +769,40 @@
                 audio: 0
             };
 
-            symbols.forEach(sym => counts[sym.type]++);
+            symbols.forEach(sym => {
+                if (counts.hasOwnProperty(sym.type)) {
+                    counts[sym.type]++;
+                }
+            });
 
             let total = 0;
             for (let type in counts) {
                 const count = counts[type];
-                const cost = count * pricing[type][TIER];
+                const typePricing = pricing[type] || {};
+                const unitPrice = typePricing[TIER] || 0;
+                const cost = count * unitPrice;
                 total += cost;
-                
+
                 const displayType = type.replace('_', '');
-                document.getElementById(displayType + 'Count').textContent = count;
-                document.getElementById(displayType + 'Cost').textContent = '$' + cost.toFixed(2);
+                const countEl = document.getElementById(displayType + 'Count');
+                if (countEl) {
+                    countEl.textContent = count;
+                }
+                const costEl = document.getElementById(displayType + 'Cost');
+                if (costEl) {
+                    costEl.textContent = '$' + cost.toFixed(2);
+                }
             }
 
             const grandTotal = total * (1 + markup);
-            document.getElementById('totalCost').textContent = '$' + grandTotal.toFixed(2);
-            document.getElementById('totalSymbolCount').textContent = symbols.length;
+            const totalCostEl = document.getElementById('totalCost');
+            if (totalCostEl) {
+                totalCostEl.textContent = '$' + grandTotal.toFixed(2);
+            }
+            const symbolCountEl = document.getElementById('totalSymbolCount');
+            if (symbolCountEl) {
+                symbolCountEl.textContent = symbols.length;
+            }
         }
 
         function updateSymbolsList() {
@@ -767,8 +811,27 @@
             symbols.forEach((sym, idx) => {
                 const item = document.createElement('div');
                 item.className = 'symbol-item' + (selectedSymbols.has(sym.id) ? ' selected' : '');
+                const details = [];
+                if (sym.room) {
+                    details.push(`Room: ${sym.room}`);
+                }
+                if (sym.label) {
+                    details.push(`Label: ${sym.label}`);
+                }
+                if (sym.metadata) {
+                    if (sym.metadata.description) {
+                        details.push(sym.metadata.description);
+                    }
+                    if (sym.metadata.placement_reasoning) {
+                        details.push(`Reason: ${sym.metadata.placement_reasoning}`);
+                    }
+                }
+                const metaHtml = details.length ? `<div class="symbol-meta">${details.join('<br>')}</div>` : '';
                 item.innerHTML = `
-                    <span>${sym.symbol} ${sym.type.replace('_', ' ')}</span>
+                    <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+                        <span>${sym.symbol} ${sym.type.replace('_', ' ')}</span>
+                        ${metaHtml}
+                    </div>
                     <button class="delete-symbol" onclick="deleteSymbol(${idx})">✖</button>
                 `;
                 item.onclick = function(e) {

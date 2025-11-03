@@ -5,7 +5,7 @@ import os
 import json
 import copy
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import uuid
 from pypdf import PdfReader, PdfWriter
@@ -20,6 +20,7 @@ import fitz  # PyMuPDF
 import io
 import traceback
 import base64
+import shutil
 import requests
 from requests_oauthlib import OAuth2Session
 from oauthlib.oauth2 import BackendApplicationClient
@@ -52,12 +53,15 @@ app.config['SIMPRO_CONFIG_FOLDER'] = 'simpro_config'
 app.config['CRM_DATA_FOLDER'] = 'crm_data'
 app.config['AI_MAPPING_FOLDER'] = 'ai_mapping'
 app.config['MAPPING_LEARNING_FOLDER'] = 'mapping_learning'
+app.config['TAKEOFF_FOLDER'] = 'takeoffs'
+app.config['TAKEOFF_IMAGE_FOLDER'] = os.path.join(app.config['TAKEOFF_FOLDER'], 'images')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 for folder in [app.config['UPLOAD_FOLDER'], app.config['OUTPUT_FOLDER'], 
                app.config['DATA_FOLDER'], app.config['LEARNING_FOLDER'],
                app.config['SIMPRO_CONFIG_FOLDER'], app.config['CRM_DATA_FOLDER'],
-               app.config['AI_MAPPING_FOLDER'], app.config['MAPPING_LEARNING_FOLDER']]:
+               app.config['AI_MAPPING_FOLDER'], app.config['MAPPING_LEARNING_FOLDER'],
+               app.config['TAKEOFF_FOLDER'], app.config['TAKEOFF_IMAGE_FOLDER']]:
     os.makedirs(folder, exist_ok=True)
 
 DATA_FILE = os.path.join(app.config['DATA_FOLDER'], 'automation_data.json')
@@ -117,6 +121,333 @@ DEFAULT_DATA = {
         "address": "Sydney, Australia"
     }
 }
+
+AUTOMATION_CATEGORIES = list(DEFAULT_DATA['automation_types'].keys())
+AUTOMATION_SYMBOL_MAP = {
+    key: (DEFAULT_DATA['automation_types'][key]['symbols'][0]
+          if DEFAULT_DATA['automation_types'][key]['symbols'] else '⚙️')
+    for key in AUTOMATION_CATEGORIES
+}
+
+
+def clamp_float(value: Optional[float],
+                min_value: float = 0.0,
+                max_value: float = 1.0,
+                default: Optional[float] = None) -> float:
+    """Safely clamp numeric values to a range."""
+    if default is None:
+        default = (min_value + max_value) / 2
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = default
+
+    if numeric is None:
+        numeric = default
+
+    return max(min(numeric, max_value), min_value)
+
+
+def safe_int(value: Optional[float], default: int = 0) -> int:
+    """Convert a value to non-negative integer."""
+    try:
+        return max(int(round(float(value))), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def format_confidence(value: Optional[float]) -> Optional[str]:
+    """Format numeric confidence to percentage string."""
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        if isinstance(value, str):
+            return value
+        return None
+
+    if numeric <= 1:
+        numeric *= 100
+    return f"{numeric:.0f}%"
+
+
+def infer_component_category(component: Dict) -> str:
+    """Infer automation category from component metadata."""
+    if not isinstance(component, dict):
+        return 'other'
+
+    explicit = component.get('automation_category') or component.get('automation_type')
+    if isinstance(explicit, str):
+        lowered = explicit.lower()
+        for category in AUTOMATION_CATEGORIES:
+            if category in lowered:
+                return category
+
+    text_hints = ' '.join(
+        str(component.get(key, '')).lower()
+        for key in ['type', 'label', 'description', 'notes', 'room', 'specifications']
+        if component.get(key)
+    )
+
+    keyword_map = {
+        'lighting': ['light', 'fixture', 'downlight', 'ceiling', 'pendant', 'luminaire', 'switch'],
+        'shading': ['shade', 'blind', 'drape', 'curtain'],
+        'security_access': ['security', 'camera', 'alarm', 'door contact', 'contact', 'access', 'keypad', 'lock', 'sensor'],
+        'climate': ['hvac', 'climate', 'thermostat', 'temperature', 'ac', 'vent', 'ducted'],
+        'audio': ['audio', 'speaker', 'av', 'surround', 'sound']
+    }
+
+    for category, keywords in keyword_map.items():
+        if any(keyword in text_hints for keyword in keywords):
+            return category
+
+    return 'other'
+
+
+def sanitize_room_entry(room: Dict, default_tier: str, index: int) -> Dict:
+    """Sanitize AI room payload ensuring numeric bounds and structure."""
+    if not isinstance(room, dict):
+        return {}
+
+    name = room.get('name') or room.get('room') or room.get('label') or room.get('type')
+    name = str(name) if name else f"Room {index + 1}"
+
+    boundaries = room.get('visual_boundaries') or room.get('bounds') or {}
+    x_start = clamp_float(boundaries.get('x_start'), 0.0, 1.0, 0.0)
+    x_end = clamp_float(boundaries.get('x_end'), 0.0, 1.0, 1.0)
+    if x_end < x_start:
+        x_start, x_end = x_end, x_start
+
+    y_start = clamp_float(boundaries.get('y_start'), 0.0, 1.0, 0.0)
+    y_end = clamp_float(boundaries.get('y_end'), 0.0, 1.0, 1.0)
+    if y_end < y_start:
+        y_start, y_end = y_end, y_start
+
+    center_data = room.get('center') or room.get('center_point') or {}
+    center_x = clamp_float(center_data.get('x'), x_start, x_end, (x_start + x_end) / 2)
+    center_y = clamp_float(center_data.get('y'), y_start, y_end, (y_start + y_end) / 2)
+
+    sanitized = {
+        'id': room.get('id', f"room_{index + 1}"),
+        'name': name,
+        'visual_boundaries': {
+            'x_start': x_start,
+            'x_end': x_end,
+            'y_start': y_start,
+            'y_end': y_end
+        },
+        'center': {'x': center_x, 'y': center_y},
+        'dimensions_estimated': room.get('dimensions_estimated', ''),
+        'notes': room.get('notes', '')
+    }
+
+    for category in AUTOMATION_CATEGORIES:
+        raw_section = room.get(category) or {}
+        if isinstance(raw_section, dict):
+            count = safe_int(raw_section.get('count', raw_section.get('quantity', 0)))
+            tier = raw_section.get('type') or raw_section.get('tier') or default_tier
+        else:
+            count = safe_int(raw_section, 0)
+            tier = default_tier
+
+        sanitized[category] = {
+            'count': count,
+            'type': tier or default_tier
+        }
+
+    return sanitized
+
+
+def prepare_analysis_payload(raw_result: Dict, default_tier: str) -> Tuple[Dict, Dict, List[str]]:
+    """Prepare sanitized analysis payload and summary metadata."""
+    if not isinstance(raw_result, dict):
+        return {}, {}, ["AI response was not a JSON object"]
+
+    sanitized: Dict = {}
+    warnings: List[str] = []
+
+    # Preserve miscellaneous keys except for the ones we rebuild
+    for key, value in raw_result.items():
+        if key not in {'rooms', 'components', 'analysis'}:
+            sanitized[key] = copy.deepcopy(value)
+
+    raw_rooms = raw_result.get('rooms', []) if isinstance(raw_result.get('rooms'), list) else []
+    sanitized_rooms: List[Dict] = []
+    room_lookup: Dict[str, Dict] = {}
+    for idx, room in enumerate(raw_rooms):
+        cleaned = sanitize_room_entry(room, default_tier, idx)
+        if cleaned:
+            sanitized_rooms.append(cleaned)
+            room_lookup[cleaned['name'].lower()] = cleaned
+
+    raw_components = raw_result.get('components', []) if isinstance(raw_result.get('components'), list) else []
+    sanitized_components: List[Dict] = []
+
+    for idx, comp in enumerate(raw_components):
+        if not isinstance(comp, dict):
+            continue
+
+        location = comp.get('location') or {}
+        if not isinstance(location, dict):
+            warnings.append(f"Component {comp.get('id', idx + 1)} missing location data and was ignored")
+            continue
+
+        x = clamp_float(location.get('x'), 0.0, 1.0, 0.5)
+        y = clamp_float(location.get('y'), 0.0, 1.0, 0.5)
+
+        room_name = comp.get('room')
+        matched_room = None
+        if isinstance(room_name, str):
+            matched_room = room_lookup.get(room_name.lower())
+
+        if not matched_room:
+            for candidate in sanitized_rooms:
+                bounds = candidate['visual_boundaries']
+                if bounds['x_start'] <= x <= bounds['x_end'] and bounds['y_start'] <= y <= bounds['y_end']:
+                    matched_room = candidate
+                    room_name = candidate['name']
+                    break
+
+        if matched_room:
+            bounds = matched_room['visual_boundaries']
+            x = clamp_float(x, bounds['x_start'], bounds['x_end'], x)
+            y = clamp_float(y, bounds['y_start'], bounds['y_end'], y)
+        else:
+            warnings.append(f"Component {comp.get('id', idx + 1)} not mapped to a room; clamped to floor plan bounds")
+
+        category = infer_component_category(comp)
+        sanitized_components.append({
+            'id': str(comp.get('id', f"C{idx + 1}")),
+            'type': comp.get('type', 'component'),
+            'automation_category': category,
+            'location': {'x': x, 'y': y},
+            'room': room_name,
+            'label': comp.get('label', comp.get('id', f"C{idx + 1}")),
+            'description': comp.get('description', ''),
+            'placement_reasoning': comp.get('placement_reasoning', ''),
+            'visual_placement': comp.get('visual_placement', ''),
+            'specifications': comp.get('specifications', ''),
+            'code_compliant': comp.get('code_compliant')
+        })
+
+    analysis_section = raw_result.get('analysis') if isinstance(raw_result.get('analysis'), dict) else {}
+    analysis_section = copy.deepcopy(analysis_section)
+    analysis_section.setdefault('method', 'ai_vision')
+    analysis_section['total_rooms'] = len(sanitized_rooms)
+
+    sanitized['rooms'] = sanitized_rooms
+    sanitized['components'] = sanitized_components
+    sanitized['analysis'] = analysis_section
+    sanitized['warnings'] = warnings
+
+    ai_notes = sanitized.get('visual_validation') or analysis_section.get('notes', '')
+    door_count = len(raw_result.get('doors', [])) if isinstance(raw_result.get('doors'), list) else 0
+    window_count = len(raw_result.get('windows', [])) if isinstance(raw_result.get('windows'), list) else 0
+
+    if door_count == 0:
+        door_count = sum(1 for comp in sanitized_components if isinstance(comp.get('type'), str) and 'door' in comp['type'].lower())
+    if window_count == 0:
+        window_count = sum(1 for comp in sanitized_components if isinstance(comp.get('type'), str) and 'window' in comp['type'].lower())
+
+    summary = {
+        'rooms_detected': len(sanitized_rooms),
+        'doors_detected': door_count,
+        'windows_detected': window_count,
+        'components_detected': len(sanitized_components),
+        'method': analysis_section.get('method', 'ai_vision'),
+        'ai_notes': ai_notes,
+        'confidence': format_confidence(
+            analysis_section.get('confidence')
+            or analysis_section.get('confidence_score')
+            or analysis_section.get('confidence_percent')
+        ),
+        'scale': analysis_section.get('scale') or analysis_section.get('scale_analysis', {}).get('detected_scale'),
+        'warnings': warnings,
+        'visual_validation': sanitized.get('visual_validation', '')
+    }
+
+    return sanitized, summary, warnings
+
+
+def get_symbol_for_category(category: Optional[str]) -> str:
+    """Return an emoji symbol for a given automation category."""
+    if not category:
+        return '⚙️'
+    return AUTOMATION_SYMBOL_MAP.get(category, '⚙️')
+
+
+def convert_components_to_symbols(components: List[Dict], image_width: int, image_height: int) -> List[Dict]:
+    """Convert normalized AI component data into canvas symbol payload."""
+    symbols: List[Dict] = []
+    for idx, comp in enumerate(components):
+        location = comp.get('location', {})
+        x = clamp_float(location.get('x'), 0.0, 1.0, 0.5)
+        y = clamp_float(location.get('y'), 0.0, 1.0, 0.5)
+
+        pixel_x = max(0, min(int(round(x * image_width)), max(image_width - 1, 0)))
+        pixel_y = max(0, min(int(round(y * image_height)), max(image_height - 1, 0)))
+
+        category = comp.get('automation_category') or infer_component_category(comp)
+        symbol = get_symbol_for_category(category)
+        symbol_type = category if category in AUTOMATION_CATEGORIES else comp.get('type', 'other')
+
+        symbols.append({
+            'id': str(comp.get('id', f'SYM{idx + 1}')),
+            'type': symbol_type,
+            'symbol': symbol,
+            'x': pixel_x,
+            'y': pixel_y,
+            'automation_category': category,
+            'label': comp.get('label', ''),
+            'room': comp.get('room', ''),
+            'metadata': {
+                'description': comp.get('description', ''),
+                'placement_reasoning': comp.get('placement_reasoning', ''),
+                'visual_placement': comp.get('visual_placement', '')
+            }
+        })
+
+    return symbols
+
+
+def generate_floorplan_preview(source_path: str, output_path: str) -> Tuple[int, int]:
+    """Generate PNG preview for a floor plan and return its dimensions."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    if source_path.lower().endswith('.pdf'):
+        doc = fitz.open(source_path)
+        page = doc[0]
+        mat = fitz.Matrix(2.0, 2.0)
+        pix = page.get_pixmap(matrix=mat)
+        pix.save(output_path)
+        width, height = pix.width, pix.height
+        doc.close()
+    else:
+        with Image.open(source_path) as img:
+            img.save(output_path)
+            width, height = img.size
+
+    return width, height
+
+
+def takeoff_record_path(takeoff_id: str) -> str:
+    return os.path.join(app.config['TAKEOFF_FOLDER'], f"{takeoff_id}.json")
+
+
+def load_takeoff_record(takeoff_id: str) -> Optional[Dict]:
+    path = takeoff_record_path(takeoff_id)
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            return json.load(f)
+    return None
+
+
+def save_takeoff_record(takeoff_id: str, data: Dict) -> None:
+    os.makedirs(app.config['TAKEOFF_FOLDER'], exist_ok=True)
+    with open(takeoff_record_path(takeoff_id), 'w') as f:
+        json.dump(data, f, indent=2)
 
 # ============================================================================
 # DATA MANAGEMENT FUNCTIONS
@@ -1288,8 +1619,10 @@ def generate_marked_up_image(original_image_path, mapping_data, output_path):
             label = comp.get('label', comp_id)
             location = comp.get('location', {})
             
-            x = int(location.get('x', 0.5) * width)
-            y = int(location.get('y', 0.5) * height)
+            x_norm = clamp_float(location.get('x'), 0.0, 1.0, 0.5)
+            y_norm = clamp_float(location.get('y'), 0.0, 1.0, 0.5)
+            x = max(0, min(int(round(x_norm * width)), max(width - 1, 0)))
+            y = max(0, min(int(round(y_norm * height)), max(height - 1, 0)))
             
             component_positions[comp_id] = (x, y)
             
@@ -1423,19 +1756,66 @@ def quotes_page():
 @app.route('/canvas')
 def canvas_page():
     automation_data = load_data()
-    pricing = automation_data.get('pricing', {})
-    # Ensure pricing has all required fields
-    if not pricing:
-        pricing = {
-            'basic': 0,
-            'premium': 0,
-            'deluxe': 0
-        }
+    automation_types = automation_data.get('automation_types', {})
+    pricing = {
+        key: value.get('base_cost_per_unit', {})
+        for key, value in automation_types.items()
+    }
     return render_template('canvas.html',
                          automation_data=automation_data,
                          pricing=pricing,
                          initial_symbols=[],
-                         tier='basic')
+                         project_id='sandbox',
+                         project_name='Manual Takeoff',
+                         floor_plan_image='',
+                         tier='basic',
+                         markup_percentage=automation_data.get('markup_percentage', 20))
+
+
+@app.route('/takeoffs/<takeoff_id>')
+def takeoff_editor(takeoff_id):
+    record = load_takeoff_record(takeoff_id)
+    if not record:
+        return "Takeoff not found", 404
+
+    automation_data = load_data()
+    automation_types = automation_data.get('automation_types', {})
+    pricing = {
+        key: value.get('base_cost_per_unit', {})
+        for key, value in automation_types.items()
+    }
+
+    floor_plan_image = url_for('takeoff_preview', takeoff_id=takeoff_id)
+
+    return render_template(
+        'canvas.html',
+        automation_data=automation_data,
+        pricing=pricing,
+        initial_symbols=record.get('initial_symbols', []),
+        project_id=takeoff_id,
+        project_name=record.get('project_name', f'Takeoff {takeoff_id}'),
+        floor_plan_image=floor_plan_image,
+        tier=record.get('tier', 'basic'),
+        markup_percentage=record.get('costs', {}).get('markup_percentage', automation_data.get('markup_percentage', 20))
+    )
+
+
+@app.route('/api/takeoffs/<takeoff_id>/preview')
+def takeoff_preview(takeoff_id):
+    record = load_takeoff_record(takeoff_id)
+    if not record:
+        return "Takeoff not found", 404
+
+    preview_filename = record.get('files', {}).get('preview')
+    if not preview_filename:
+        return "Preview not available", 404
+
+    preview_path = os.path.join(app.config['TAKEOFF_IMAGE_FOLDER'], preview_filename)
+    if not os.path.exists(preview_path):
+        return "Preview file missing", 404
+
+    return send_file(preview_path, mimetype='image/png')
+
 
 @app.route('/learning')
 def learning_page():
@@ -1636,50 +2016,62 @@ def analyze_floorplan():
         automation_types = request.form.getlist('automation_types') or request.form.getlist('automation_types[]')
 
         filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        takeoff_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{uuid.uuid4().hex[:6]}"
+        stored_filename = f"{takeoff_id}_{filename}" if filename else f"{takeoff_id}.plan"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], stored_filename)
         file.save(filepath)
 
         # Run AI analysis
-        analysis_result = analyze_floorplan_with_ai(filepath)
+        analysis_raw = analyze_floorplan_with_ai(filepath)
 
-        # Log AI analysis result for debugging
-        if 'error' in analysis_result:
-            print(f"AI Analysis Error: {analysis_result.get('error')}")
-            print(f"AI Analysis Message: {analysis_result.get('message', 'No message')}")
+        if not isinstance(analysis_raw, dict):
+            return jsonify({'success': False, 'error': 'AI returned an unexpected response format.'}), 502
 
-        if 'error' in analysis_result and analysis_result.get('fallback'):
-            print("Using fallback estimation mode")
-            analysis_result = {
-                "rooms": [
-                    {
-                        "name": "Estimated Room",
-                        "lighting": {"count": 5, "type": tier},
-                        "shading": {"count": 2, "type": tier},
-                        "security_access": {"count": 1, "type": tier},
-                        "climate": {"count": 1, "type": tier},
-                        "audio": {"count": 0, "type": tier}
-                    }
-                ],
-                "notes": "Fallback estimation - AI analysis unavailable"
-            }
-        else:
-            print(f"AI Analysis successful: {len(analysis_result.get('rooms', []))} rooms detected")
+        if analysis_raw.get('error'):
+            error_message = analysis_raw.get('message') or analysis_raw.get('error')
+            print(f"AI Analysis Error: {error_message}")
+            return jsonify({'success': False, 'error': f"AI analysis failed: {error_message}"}), 502
+
+        sanitized_result, analysis_summary, warnings = prepare_analysis_payload(analysis_raw, tier)
+
+        if not sanitized_result.get('rooms'):
+            return jsonify({
+                'success': False,
+                'error': 'AI vision could not identify any rooms. Please upload a clearer floor plan or adjust the document.'
+            }), 422
+
+        if not sanitized_result.get('components'):
+            warning_text = warnings[0] if warnings else ''
+            return jsonify({
+                'success': False,
+                'error': 'AI vision did not return any component placements. Please retry with a clearer floor plan.',
+                'details': warning_text
+            }), 422
+
+        analysis_summary['takeoff_id'] = takeoff_id
+        if analysis_summary.get('visual_validation') and not analysis_summary.get('ai_notes'):
+            analysis_summary['ai_notes'] = analysis_summary['visual_validation']
+
+        # Generate preview for canvas editor
+        preview_filename = f"{takeoff_id}_preview.png"
+        preview_path = os.path.join(app.config['TAKEOFF_IMAGE_FOLDER'], preview_filename)
+        image_width, image_height = generate_floorplan_preview(filepath, preview_path)
 
         # Calculate costs
         data_config = load_data()
-        rooms = analysis_result.get('rooms', [])
-
+        rooms = sanitized_result.get('rooms', [])
         total_rooms = len(rooms)
         total_automation_points = 0
         cost_items = []
+        selected_types = set(automation_types) if automation_types else set(AUTOMATION_CATEGORIES)
 
         for room in rooms:
-            for automation_key in ['lighting', 'shading', 'security_access', 'climate', 'audio']:
+            for automation_key in AUTOMATION_CATEGORIES:
                 automation_data = room.get(automation_key, {})
                 count = automation_data.get('count', 0)
                 room_tier = automation_data.get('type', tier)
 
-                if count > 0 and automation_key in automation_types:
+                if count > 0 and automation_key in selected_types:
                     total_automation_points += count
                     automation_config = data_config['automation_types'].get(automation_key, {})
                     unit_cost = automation_config.get('base_cost_per_unit', {}).get(room_tier, 0)
@@ -1696,71 +2088,31 @@ def analyze_floorplan():
                     })
 
         subtotal = sum(item['total'] for item in cost_items)
-        markup = subtotal * (data_config['markup_percentage'] / 100)
+        markup = subtotal * (data_config.get('markup_percentage', 0) / 100)
         grand_total = subtotal + markup
 
         # Generate output filenames
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        annotated_filename = f"annotated_{timestamp}.png"  # PNG for marked-up floor plan
-        quote_filename = f"quote_{timestamp}.pdf"
+        annotated_filename = f"annotated_{takeoff_id}.png"
+        quote_filename = f"quote_{takeoff_id}.pdf"
         annotated_path = os.path.join(app.config['OUTPUT_FOLDER'], annotated_filename)
         quote_path = os.path.join(app.config['OUTPUT_FOLDER'], quote_filename)
 
         # Generate annotated floor plan with symbol markings
         try:
-            # Prepare mapping data from analysis result for generate_marked_up_image
-            components = analysis_result.get('components', [])
-
+            components = sanitized_result.get('components', [])
+            success = False
             if components:
-                # Convert quote analysis format to mapping format
-                mapping_data = {
-                    'components': components,
-                    'analysis': {
-                        'scale': analysis_result.get('scale', 'not detected'),
-                        'total_rooms': total_rooms,
-                        'notes': analysis_result.get('notes', '')
-                    }
-                }
+                success = generate_marked_up_image(filepath, sanitized_result, annotated_path)
 
-                # Generate marked-up image with symbols at precise coordinates
-                success = generate_marked_up_image(filepath, mapping_data, annotated_path)
-
-                if success:
-                    print(f"✓ Generated annotated floor plan with {len(components)} symbols marked")
-                else:
-                    print("⚠ Failed to generate marked-up image, using copy instead")
-                    import shutil
-                    # Fallback: convert PDF to PNG without markings
-                    if filepath.endswith('.pdf'):
-                        doc = fitz.open(filepath)
-                        page = doc[0]
-                        mat = fitz.Matrix(2.0, 2.0)
-                        pix = page.get_pixmap(matrix=mat)
-                        pix.save(annotated_path)
-                        doc.close()
-                    else:
-                        from PIL import Image
-                        img = Image.open(filepath)
-                        img.save(annotated_path, 'PNG')
+            if success:
+                print(f"✓ Generated annotated floor plan with {len(components)} symbols marked")
             else:
-                print("⚠ No component coordinates in analysis, creating unmarked copy")
-                import shutil
-                # No coordinates available, just convert to PNG
-                if filepath.endswith('.pdf'):
-                    doc = fitz.open(filepath)
-                    page = doc[0]
-                    mat = fitz.Matrix(2.0, 2.0)
-                    pix = page.get_pixmap(matrix=mat)
-                    pix.save(annotated_path)
-                    doc.close()
-                else:
-                    from PIL import Image
-                    img = Image.open(filepath)
-                    img.save(annotated_path, 'PNG')
-
+                print("⚠ Using unannotated preview for floor plan output")
+                shutil.copyfile(preview_path, annotated_path)
         except Exception as e:
             print(f"Error creating annotated floor plan: {e}")
             print(f"Traceback: {traceback.format_exc()}")
+            shutil.copyfile(preview_path, annotated_path)
 
         # Generate quote PDF
         try:
@@ -1783,7 +2135,6 @@ def analyze_floorplan():
             story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
             story.append(Spacer(1, 0.5*inch))
 
-            # Add cost breakdown table
             table_data = [['Item', 'Quantity', 'Unit Cost', 'Labor', 'Total']]
             for item in cost_items:
                 table_data.append([
@@ -1795,7 +2146,7 @@ def analyze_floorplan():
                 ])
 
             table_data.append(['', '', '', 'Subtotal:', f"${subtotal:,.2f}"])
-            table_data.append(['', '', '', f'Markup ({data_config["markup_percentage"]}%):', f"${markup:,.2f}"])
+            table_data.append(['', '', '', f"Markup ({data_config.get('markup_percentage', 0)}%):", f"${markup:,.2f}"])
             table_data.append(['', '', '', 'TOTAL:', f"${grand_total:,.2f}"])
 
             t = Table(table_data, colWidths=[3*inch, 1*inch, 1*inch, 1*inch, 1.5*inch])
@@ -1815,26 +2166,64 @@ def analyze_floorplan():
         except Exception as e:
             print(f"Error creating quote PDF: {e}")
 
+        initial_symbols = convert_components_to_symbols(
+            sanitized_result.get('components', []), image_width, image_height
+        )
+
+        preview_url = url_for('takeoff_preview', takeoff_id=takeoff_id)
+        annotated_url = url_for('download_file', filename=annotated_filename)
+        quote_url = url_for('download_file', filename=quote_filename)
+        editor_url = url_for('takeoff_editor', takeoff_id=takeoff_id)
+
+        costs_payload = {
+            'items': cost_items,
+            'subtotal': subtotal,
+            'markup': markup,
+            'grand_total': grand_total,
+            'markup_percentage': data_config.get('markup_percentage', 0)
+        }
+
+        takeoff_record = {
+            'id': takeoff_id,
+            'project_name': project_name,
+            'tier': tier,
+            'automation_types': list(selected_types),
+            'analysis': sanitized_result,
+            'summary': analysis_summary,
+            'costs': costs_payload,
+            'files': {
+                'original': stored_filename,
+                'annotated': annotated_filename,
+                'quote': quote_filename,
+                'preview': preview_filename
+            },
+            'image': {
+                'width': image_width,
+                'height': image_height
+            },
+            'initial_symbols': initial_symbols,
+            'warnings': warnings,
+            'created_at': datetime.now().isoformat()
+        }
+        save_takeoff_record(takeoff_id, takeoff_record)
+
         response = {
             'success': True,
+            'project_id': takeoff_id,
             'project_name': project_name,
             'total_rooms': total_rooms,
             'total_automation_points': total_automation_points,
-            'confidence': '85%',  # Could be calculated from AI response
+            'confidence': analysis_summary.get('confidence') or 'N/A',
             'total_cost': f'${grand_total:,.2f}',
-            'annotated_pdf': annotated_filename,
-            'quote_pdf': quote_filename,
-            'analysis': analysis_result,
-            'costs': {
-                'items': cost_items,
-                'subtotal': subtotal,
-                'markup': markup,
-                'grand_total': grand_total
-            },
+            'analysis': analysis_summary,
+            'analysis_details': sanitized_result,
+            'costs': costs_payload,
             'files': {
-                'annotated_pdf': f'/api/download/{annotated_filename}',
-                'quote_pdf': f'/api/download/{quote_filename}'
-            }
+                'annotated_pdf': annotated_url,
+                'quote_pdf': quote_url,
+                'floor_plan_preview': preview_url
+            },
+            'editor_url': editor_url
         }
 
         return jsonify(response)
@@ -3210,6 +3599,20 @@ def generate_final_quote():
         story.append(Paragraph(f"<b>Total: ${total:.2f}</b>", styles['Heading2']))
 
         doc.build(story)
+
+        if project_id:
+            record = load_takeoff_record(project_id)
+            if record:
+                record.setdefault('files', {})['final_quote'] = output_filename
+                exports = record.setdefault('exports', [])
+                exports.append({
+                    'filename': output_filename,
+                    'generated_at': datetime.now().isoformat(),
+                    'symbol_count': len(symbols),
+                    'tier': tier
+                })
+                record['initial_symbols'] = symbols
+                save_takeoff_record(project_id, record)
 
         return jsonify({'success': True, 'filename': output_filename})
 

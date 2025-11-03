@@ -634,7 +634,8 @@
                 if (data.success) {
                     displayResults(data);
                 } else {
-                    showError(data.error);
+                    const detailMessage = data.details ? `${data.error} (${data.details})` : data.error;
+                    showError(detailMessage);
                 }
             } catch (error) {
                 document.getElementById('loading').classList.remove('active');
@@ -643,38 +644,78 @@
         });
 
         function displayResults(data) {
+            const analysis = data.analysis || {};
+            const analysisDetails = data.analysis_details || {};
+            const method = analysis.method === 'ai_vision' ? '🤖 AI Vision' : '📐 Smart Grid';
+            const detailedNotes = analysis.ai_notes || analysis.visual_validation || analysisDetails.visual_validation || (analysisDetails.analysis && analysisDetails.analysis.notes) || '';
+            const warnings = analysis.warnings || [];
+            const scaleDetected = analysis.scale || (analysisDetails.analysis && analysisDetails.analysis.scale);
+            const costItems = (data.costs && data.costs.items) ? data.costs.items : [];
+
             const html = `
                 <div class="results">
                     <h3>Analysis Results</h3>
                     <div class="cost-item">
                         <span>Rooms Detected:</span>
-                        <span>${data.analysis.rooms_detected}</span>
+                        <span>${analysis.rooms_detected ?? '—'}</span>
                     </div>
                     <div class="cost-item">
                         <span>Doors Detected:</span>
-                        <span>${data.analysis.doors_detected}</span>
+                        <span>${analysis.doors_detected ?? '—'}</span>
                     </div>
                     <div class="cost-item">
                         <span>Windows Detected:</span>
-                        <span>${data.analysis.windows_detected}</span>
+                        <span>${analysis.windows_detected ?? '—'}</span>
                     </div>
+                    ${analysis.components_detected !== undefined ? `
+                        <div class="cost-item">
+                            <span>Components Detected:</span>
+                            <span>${analysis.components_detected}</span>
+                        </div>
+                    ` : ''}
                     <div class="cost-item">
                         <span>Analysis Method:</span>
-                        <span>${data.analysis.method === 'ai_vision' ? '🤖 AI Vision' : '📐 Smart Grid'}</span>
+                        <span>${method}</span>
                     </div>
-                    ${data.analysis.ai_notes ? `<div class="info-box" style="margin-top: 15px;"><strong>AI Notes:</strong> ${data.analysis.ai_notes}</div>` : ''}
-                    
+                    ${analysis.confidence ? `
+                        <div class="cost-item">
+                            <span>AI Confidence:</span>
+                            <span>${analysis.confidence}</span>
+                        </div>
+                    ` : ''}
+                    ${scaleDetected ? `
+                        <div class="cost-item">
+                            <span>Detected Scale:</span>
+                            <span>${scaleDetected}</span>
+                        </div>
+                    ` : ''}
+                    ${data.project_id ? `
+                        <div class="cost-item">
+                            <span>Takeoff ID:</span>
+                            <span>${data.project_id}</span>
+                        </div>
+                    ` : ''}
+                    ${detailedNotes ? `<div class="info-box" style="margin-top: 15px;"><strong>AI Notes:</strong> ${detailedNotes}</div>` : ''}
+                    ${warnings.length ? `
+                        <div class="error" style="margin-top: 15px;">
+                            <strong>Warnings:</strong>
+                            <ul style="margin-top: 10px;">
+                                ${warnings.map(w => `<li>${w}</li>`).join('')}
+                            </ul>
+                        </div>
+                    ` : ''}
+
                     ${data.files && data.files.floor_plan_preview ? `
                         <div style="margin: 30px 0; padding: 20px; background: #f8f9fa; border-radius: 10px;">
-                            <h3 style="color: #556B2F; margin-bottom: 15px;">📐 Annotated Floor Plan Preview</h3>
-                            <img src="${data.files.floor_plan_preview}" 
-                                 alt="Floor Plan Preview" 
+                            <h3 style="color: #556B2F; margin-bottom: 15px;">📐 Floor Plan Preview</h3>
+                            <img src="${data.files.floor_plan_preview}"
+                                 alt="Floor Plan Preview"
                                  style="max-width: 100%; border: 3px solid #556B2F; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); display: block; margin: 0 auto;">
                         </div>
                     ` : ''}
-                    
+
                     <h3 style="margin-top: 30px;">Cost Breakdown</h3>
-                    ${data.costs.items.map(item => `
+                    ${costItems.map(item => `
                         <div class="cost-item">
                             <span>${item.type} (${item.quantity}x)</span>
                             <span>$${item.total.toFixed(2)}</span>
@@ -682,20 +723,20 @@
                     `).join('')}
                     <div class="cost-item">
                         <span>Subtotal:</span>
-                        <span>$${data.costs.subtotal.toFixed(2)}</span>
+                        <span>$${(data.costs?.subtotal ?? 0).toFixed(2)}</span>
                     </div>
                     <div class="cost-item">
                         <span>Markup:</span>
-                        <span>$${data.costs.markup.toFixed(2)}</span>
+                        <span>$${(data.costs?.markup ?? 0).toFixed(2)}</span>
                     </div>
                     <div class="cost-item">
                         <span>GRAND TOTAL:</span>
-                        <span>$${data.costs.grand_total.toFixed(2)}</span>
+                        <span>$${(data.costs?.grand_total ?? 0).toFixed(2)}</span>
                     </div>
 
                     <div class="download-links">
-                        <a href="${data.files.annotated_pdf}" class="download-link" download>📄 Download Annotated Floor Plan</a>
-                        <a href="${data.files.quote_pdf}" class="download-link" download>💰 Download Quote PDF</a>
+                        <a href="${data.files?.annotated_pdf ?? '#'}" class="download-link" download>📄 Download Annotated Floor Plan</a>
+                        <a href="${data.files?.quote_pdf ?? '#'}" class="download-link" download>💰 Download Quote PDF</a>
                         ${data.editor_url ? `<a href="${data.editor_url}" class="download-link" style="background: linear-gradient(135deg, #556B2F 0%, #6B8E23 100%);">🎨 Open in Interactive Editor</a>` : ''}
                     </div>
                 </div>
